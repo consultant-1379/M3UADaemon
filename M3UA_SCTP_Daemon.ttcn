@@ -1,0 +1,2640 @@
+///////////////////////////////////////////////////////////////////////////////
+//                                                                           //
+// Copyright Test Competence Center (TCC) ETH 2008-2022                      //
+//                                                                           //
+// The copyright to the computer  program(s) herein  is the property of TCC. //
+// The program(s) may be used and/or copied only with the written permission //
+// of TCC or in accordance with  the terms and conditions  stipulated in the //
+// agreement/contract under which the program(s) have been supplied          //
+//                                                                           //
+///////////////////////////////////////////////////////////////////////////////
+//
+//  File:           M3UA_SCTP_Daemon.ttcn
+//  Description:    The M3UA Server behaviour
+//  Rev:            R4A01
+//  Prodnr:         CNL 113 487
+//  Updated:        2008-07-30
+//  Contact:        http://ttcn.ericsson.se
+///////////////////////////////////////////////
+module  M3UA_SCTP_Daemon
+{
+import from Base_component all;
+modulepar
+{
+  boolean                  tsp_logVerbose := false;
+  Total_M3UA_Entities_Data tsp_Total_M3UA_Entities_Data;
+  float                    tsp_Timer := 2.0;  //general timer used in M3UA server
+  float                    tsp_Activation_Timer := 60.0;
+  float                    tsp_ASPUP_Resend_Timer := 2.0;
+  float                    tsp_ASPAC_Resend_Timer := 2.0;
+  float                    tsp_Assoc_Restart_Timer := 60.0;
+  float                    tsp_Heartbeat_Timer := 30.0;
+  integer                  tsp_SCTP_PayloadProtocolID :=  3;//M3UA=3,unspecified=0
+  boolean                  tsp_M3UA_Server_Mode := false;
+  boolean                  tsp_SCTP_Server_Mode := false;
+  boolean                  tsp_Enable_M3UA_Heartbeat := false;
+  boolean                  tsp_All_SCTP_Data_To_TCP := false;
+  float                    tsp_ASPUPWait_timer := 60.0;
+  //send data to TCP regardless of registration status,
+  //default is false for backward compatibility
+}
+
+import from General_Types all;
+
+import from TCPasp_Types all;
+import from TCPasp_PortType all;
+
+import from MTP3asp_Types all;
+import from M3UA_SCTP_Types all;
+
+import from SCTPasp_Types all;
+import from SCTPasp_PortType all;
+
+import from Sync_component all;
+import from Sync_methods all;
+import from Common_functions all;
+
+//+++++++++++++++++++++++++++++++
+//  External encoding/decoding functions
+//+++++++++++++++++++++++++++++++
+
+external function enc_PDU_M3UA (in PDU_M3UA pl_PDU_M3UA)
+return octetstring;
+
+external function dec_PDU_M3UA (in octetstring pl_octetstring)
+return PDU_M3UA;
+
+//+++++++++++++++++++++++++++++++
+// The structure of modulpar tsp_Total_M3UA_Entities_Data.
+// These types are needed to identify the M3UA entities
+//+++++++++++++++++++++++++++++++
+type record of Single_M3UA_Entity_Data Total_M3UA_Entities_Data;
+
+type record Single_M3UA_Entity_Data
+{
+  integer                 ni,
+  integer                 sut_pc,
+  integer                 tester_pc,
+  charstring              destination_name optional,
+  SCTP_Assocation_Address assoc
+}
+
+type record SCTP_Assocation_Address
+{
+  integer           local_sctp_port,
+  charstring        local_ip_addr,
+  integer           remote_sctp_port,
+  charstring        remote_ip_addr
+}
+
+//+++++++++++++++++++++++++++++++
+// Definition of M3UA_Table which contains M3UA entity data:
+//+++++++++++++++++++++++++++++++
+type record of M3UA_Entity M3UA_Table
+
+type record M3UA_Entity
+{
+  M3UA_CommStatus          commStatus optional,         //status of M3UA entity
+  integer                  sCTP_Assoc_ID optional,      //
+  integer                  tcp_client_id optional,      //TCP
+  Single_M3UA_Entity_Data  single_M3UA_Entity_Data,     //modulepar
+  integer                  dummy_tcp_client_id optional
+}
+
+// type for status of SCTP M3UA communication for each user
+type enumerated M3UA_CommStatus
+{
+  aSP_Down_initial_State (0),
+  aSP_Down_sCTP_Initialize_Done (1),
+  aSP_Down_sCTP_Associate_done (2),
+  aSP_Down_commUP_Received (3),
+  aSP_Down_ASPUP_Sent (4),
+  aSP_Inactive (5),
+  aSP_Inact_ASPAC_Sent (6),
+  aSP_Active (7)   //aSPAC_Ack_Received
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// M3UA Server Component definition
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+type component M3UA_SCTP_Daemon_CT extends Sync_CT, Base_CT  // includes EncDec + Mapping too!!
+{
+  //========================Component constants===========================
+
+  //========================Component variables===========================
+  var M3UA_Table             v_Table;      //holding the data for M3UA entities
+  var integer                v_Table_Size; //number of M3UA entities
+  var integer                v_assoc_Id,v_destPort;
+  var SAC_STATE              v_comm_Lost_State;
+  var charstring       v_address_List,v_destIpAddr;
+
+  var ASP_SCTP        v_ASP_SCTP
+  var ASP_SCTP_SEND_FAILED v_ASP_SCTP_SEND_FAILED;
+  var ASP_SCTP_RESULT v_ASP_SCTP_RESULT;
+  var ASP_SCTP_Connected v_ASP_SCTP_Connected;
+  var ASP_SCTP_ASSOC_CHANGE v_ASP_SCTP_ASSOC_CHANGE;
+  var ASP_SCTP_SHUTDOWN_EVENT v_ASP_SCTP_SHUTDOWN_EVENT;
+
+  var MTP3_to_M3UAserver_msg v_MTP3_to_M3UAserver_msg_Status;
+  var ASP_TCP                v_tcp_asp_Status;
+  var ASP_TCP_Close          v_ASP_TCP_Close;
+
+  var integer                v_assocID, v_streamID, v_result, v_index;
+  var integer                v_msgLength := -1;
+  var octetstring            v_data := ''O;
+  var PDU_M3UA               v_PDU_M3UA;
+
+  var integer                v_Next_Dummy_TCP_client_id := 0;
+  var CharstringList v_M3UA_Entities_ASPUP_waitList; //list of entity indexes from which we are waiting for ASPUP messages
+
+  //========================Component Timers-=============================
+  timer T_timer := tsp_Timer;  //General timer
+  timer T_Activation_timer := tsp_Activation_Timer;
+  timer T_ASPUP_resend := tsp_ASPUP_Resend_Timer;
+  timer T_ASPAC_resend := tsp_ASPAC_Resend_Timer;
+  timer T_Heartbeat := tsp_Heartbeat_Timer;
+  timer T_Assoc_restart := tsp_Assoc_Restart_Timer;
+  //========================Component Port Declarations====================
+  port TCPasp_PT    TCP_PORT;  // port towards MTP3/M3UA test port
+  port SCTPasp_PT  SCTP_PORT; // port towards target through SCTP
+
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// M3UA PDU templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+template PDU_M3UA t_PDU_M3UA_ASPUP
+( in template M3UA_ASP_Identifier pl_aSP_Identifier,
+  in template M3UA_Info_String    pl_info_String ) :=
+{
+  m3UA_ASPUP :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0301'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      aSP_Identifier := pl_aSP_Identifier,
+      info_String    := pl_info_String
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPUP_Ack :=
+{
+  m3UA_ASPUP_Ack :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0304'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      info_String := omit
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPAC
+( in template M3UA_Traffic_Mode_Type pl_traffic_Mode_Type,
+  in template M3UA_Routing_Context   pl_routing_Context,
+  in template M3UA_Info_String       pl_info_String ) :=
+{
+  m3UA_ASPAC :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0401'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      traffic_Mode_Type := pl_traffic_Mode_Type,
+      routing_Context := pl_routing_Context,
+      info_String := pl_info_String
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_Beat_Ack
+( in template M3UA_Heartbeat_Data pl_heartbeat_Data ) :=
+{
+  m3UA_BEAT_Ack :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0306'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      heartbeat_Data := pl_heartbeat_Data
+    }
+  }
+}
+
+template PDU_M3UA t_M3UA_DATA
+( in template M3UA_Network_Appearance  pl_network_Appearance,
+  in template M3UA_Routing_Context     pl_routing_Context,
+  in template M3UA_Protocol_Data       pl_protocol_Data,
+  in template M3UA_Correlation_ID      pl_correlation_ID ) :=
+{
+  m3UA_DATA :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0101'O,
+    messageLength      := 0,       // dummy
+    messageParameters  :=
+    {
+      network_Appearance := pl_network_Appearance,
+      routing_Context    := pl_routing_Context,
+      protocol_Data      := pl_protocol_Data,
+      correlation_ID     := pl_correlation_ID
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPIA
+( in template M3UA_Routing_Context pl_routing_Context,
+  in template M3UA_Info_String pl_info_String) :=
+{
+  m3UA_ASPIA :=
+  {
+    version := '01'O,
+    reserved:= '00'O,   // 3.1.3
+    messageClassAndType:= '0402'O,
+    messageLength:=  0,  // dummy value
+    messageParameters :=
+    {
+      routing_Context := pl_routing_Context,
+      info_String := pl_info_String
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_DAVA
+(
+  in template M3UA_Network_Appearance    pl_network_Appearance,
+  in template M3UA_Routing_Context       pl_routing_Context,
+  in template M3UA_Affected_Point_Codes  pl_affected_Point_Codes,
+  in template M3UA_Info_String           pl_info_String
+)  :=
+{
+  m3UA_DAVA :=
+  {
+    version  := '01'O,
+    reserved := '00'O,   // 3.1.3
+    messageClassAndType := '0202'O ,
+    messageLength:= 0,       // dummy
+    messageParameters  :=
+    {
+      network_Appearance    := pl_network_Appearance,     //tag = '0200'O;
+      routing_Context       := pl_routing_Context,        //tag = '0006'O;
+      affected_Point_Codes  := pl_affected_Point_Codes,   //tag = '0012'O;
+      info_String           := pl_info_String             //tag = '0004'O )"
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPDN :=
+{
+  m3UA_ASPDN :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,
+    messageClassAndType:= '0302'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      info_String    := omit
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPDN_Ack :=
+{
+  m3UA_ASPDN_Ack :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,
+    messageClassAndType:= '0305'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      info_String    := omit
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPAC_Ack
+( in template M3UA_Traffic_Mode_Type     pl_traffic_mode_type,
+  in template M3UA_Routing_Context       pl_routing_Context ) :=
+{
+  m3UA_ASPAC_Ack :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,
+    messageClassAndType:= '0403'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      traffic_Mode_Type := pl_traffic_mode_type,
+      routing_Context:= pl_routing_Context,
+      info_String    := omit
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_ASPIA_Ack
+( in template M3UA_Routing_Context       pl_routing_Context ) :=
+{
+  m3UA_ASPIA_Ack :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,
+    messageClassAndType:= '0404'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      routing_Context:= pl_routing_Context,
+      info_String    := omit
+    }
+  }
+}
+
+template PDU_M3UA t_PDU_M3UA_Heartbeat
+( in template M3UA_Heartbeat_Data pl_heartbeat_Data ) :=
+{
+  m3UA_BEAT :=
+  {
+    version            := '01'O,
+    reserved           := '00'O,   // 3.1.3
+    messageClassAndType:= '0303'O,
+    messageLength      := 0,  // dummy value
+    messageParameters  :=
+    {
+      heartbeat_Data := pl_heartbeat_Data
+    }
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// end of M3UA PDU templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// M3UA Parameter templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+template M3UA_Protocol_Data t_M3UA_Protocol_Data
+( template OCT4        pl_oPC,
+  template OCT4        pl_dPC,
+  template OCT1        pl_sI,
+  template OCT1        pl_nI,
+  template OCT1        pl_mP,
+  template OCT1        pl_sLS,
+  template octetstring pl_userProtocolData ) :=
+{
+  tag       := '0210'O,
+  lengthInd := 0,  // dummy integer!
+  oPC       := pl_oPC,
+  dPC       := pl_dPC,
+  sI        := pl_sI,
+  nI        := pl_nI,
+  mP        := pl_mP,
+  sLS       := pl_sLS,
+  userProtocolData := pl_userProtocolData
+}
+
+template M3UA_ASP_Identifier t_M3UA_ASP_Identifier
+( template OCT4 pl_aSPIdentifier ) :=
+{
+  tag            := '0011'O,            //OCT2
+  lengthInd      := 0,                  //dummy integer!
+  aSPIdentifier  := pl_aSPIdentifier    //OCT4
+}
+
+template M3UA_Info_String t_M3UA_Info_String
+( template M3UA_OCT0_255 pl_infoString ) :=
+{
+  tag         := '0004'O,          //OCT2
+  lengthInd   := 0,                //dummy integer!
+  infoString  := pl_infoString     //octetstring length (0..255)
+}
+
+template M3UA_Traffic_Mode_Type t_M3UA_Traffic_Mode_Type
+( template OCT4 pl_trafficModeType ) :=
+{
+  tag               := '000B'O,              //OCT2
+  lengthInd         := 0,                    //dummy integer!
+  trafficModeType   := pl_trafficModeType    //OCT4
+}
+
+template M3UA_Routing_Context t_M3UA_Routing_Context
+( template octetstring pl_routingContext ) :=
+{
+  tag             := '0006'O,
+  lengthInd       := 0,                 //dummy integer!
+  routingContext  := pl_routingContext  //octetstring
+}
+
+template M3UA_Heartbeat_Data t_M3UA_Heartbeat_Data
+( template octetstring pl_heartbeat_Data ) :=
+{
+  tag            := '0009'O,
+  lengthInd      := 0,                 //dummy integer!
+  heartbeat_Data := pl_heartbeat_Data  //octetstring
+}
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// end of M3UA Parameter templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// Dynamic part of the M3UA server
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+function f_isEntityOnTheList(in charstring p_entityDestinationName) runs on M3UA_SCTP_Daemon_CT return boolean
+{
+  for(var integer v_waitListIndex := 0; v_waitListIndex < lengthof(v_M3UA_Entities_ASPUP_waitList); v_waitListIndex := v_waitListIndex +1)
+  {
+    if(v_M3UA_Entities_ASPUP_waitList[v_waitListIndex]==p_entityDestinationName)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Initialize_Table
+// Initialize the Table with parameters read from the configuration file
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Initialize_Table() runs on M3UA_SCTP_Daemon_CT
+{
+  v_Table_Size := sizeof(tsp_Total_M3UA_Entities_Data);
+
+  if (v_Table_Size == 0)
+  {
+    log("M3UA config file empty");
+    setverdict(fail);
+    return;
+  }
+
+  var integer index;
+  var integer index2;
+  var boolean vl_new_data := true;
+  var integer vl_offset := 0;
+
+  for (index := 0; index < v_Table_Size; index := index + 1)
+  {
+    if (f_valueInAList(v_M3UA_Entities_ASPUP_waitList,
+      tsp_Total_M3UA_Entities_Data[index].destination_name)){
+      // compare to all previous entries in table, if duplication then ignore
+      for (index2 := 0; index2 < index - vl_offset; index2 := index2 + 1)
+      {
+        if((v_Table[index2].single_M3UA_Entity_Data.ni ==
+            tsp_Total_M3UA_Entities_Data[index].ni)
+          and
+          (v_Table[index2].single_M3UA_Entity_Data.sut_pc ==
+            tsp_Total_M3UA_Entities_Data[index].sut_pc)
+          and
+          (v_Table[index2].single_M3UA_Entity_Data.tester_pc ==
+            tsp_Total_M3UA_Entities_Data[index].tester_pc)
+          and (
+            (v_Table[index2].single_M3UA_Entity_Data.destination_name ==
+              tsp_Total_M3UA_Entities_Data[index].destination_name)
+            // do not check if omit:
+            or (v_Table[index2].single_M3UA_Entity_Data.destination_name == omit)
+          )
+        )// data matches
+        //  Destination name == omit can be only the last entry among entries with
+        //  same ni, sut_pc, tester_pc in the table
+        //  This will be the default destination
+        {
+          log("Config file contains duplicate sets of ni - sut_pc - tester_pc - destination_name",
+            " info at index ", index+1, "!");
+          log("Duplicate entry: ", tsp_Total_M3UA_Entities_Data[index]);
+          log("Only the initial entry will be kept, the duplicate is ignored.");
+
+          vl_new_data := false;
+          index2 := index - vl_offset; //Break the for loop
+        }
+      }
+    }
+    else
+    {
+      log("destination_name ", tsp_Total_M3UA_Entities_Data[index].destination_name,
+        " is not found in provided list, continue searching...");
+      vl_new_data := false;
+    }
+
+    if (vl_new_data == true)
+    {
+      f_AssocData_check(tsp_Total_M3UA_Entities_Data[index].assoc,
+        index - vl_offset)
+      v_Table[index - vl_offset].commStatus    := aSP_Down_initial_State;
+      v_Table[index - vl_offset].sCTP_Assoc_ID := omit;
+      v_Table[index - vl_offset].tcp_client_id := omit;  // init to omit
+      v_Table[index - vl_offset].single_M3UA_Entity_Data
+      := tsp_Total_M3UA_Entities_Data[index];
+      v_Table[index - vl_offset].dummy_tcp_client_id := omit;  // init to omit
+    }
+    else
+    {
+      vl_offset := vl_offset + 1;
+      vl_new_data := true;
+    }
+  }
+  v_Table_Size := v_Table_Size - vl_offset;
+
+  if (v_Table_Size > 128)
+  {
+    log("----------------------------------------------------------------");
+    log("The number of M3UA Entities is ",v_Table_Size);
+    log("but this is larger than the allowed value of 128");
+    log("Unable to proceed with initialization of M3UA server!");
+    log("----------------------------------------------------------------");
+    setverdict(fail);
+    return;
+  }
+
+  log("Loading of user data complete");
+  if (tsp_logVerbose)
+  {
+    log("List of users (", v_Table_Size, "):");
+    log(v_Table);
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Initialize_M3UA
+// Initialize the M3UA timers
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Initialize_M3UA() runs on M3UA_SCTP_Daemon_CT
+{
+  if (tsp_SCTP_PayloadProtocolID == 3) { // M3UA protocol
+    if (not tsp_M3UA_Server_Mode)
+    {
+      T_ASPUP_resend.start;
+      T_ASPAC_resend.start;
+    }
+    if (tsp_Enable_M3UA_Heartbeat) {
+      T_Heartbeat.start;
+    }
+  }
+  T_Activation_timer.start;
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_ASPUP_Sending
+// After  reception of SCTP_CommunicationUp's M3UA ASPUP is sent by every
+// entity and the M3UA ASPUP_ACK is received for every entity
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_ASPUP_Sending(integer index)  runs on M3UA_SCTP_Daemon_CT
+{
+  SCTP_PORT.send
+  (t_S_SCTP_Send
+    (v_Table[index].sCTP_Assoc_ID,
+      0, //    streamID
+      enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPUP(omit,omit))),
+      0, //?   context
+      tsp_SCTP_PayloadProtocolID
+    )
+  )
+
+  v_Table[index].commStatus := aSP_Down_ASPUP_Sent;
+  if (tsp_logVerbose)
+  {
+    log("M3UA_ASPUP sent.");
+    log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_logActiveUsers
+// Log the active users periodically
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_logActiveUsers() runs on M3UA_SCTP_Daemon_CT
+{
+  var integer vl_ok_nr := 0;
+  log("***************************************************************");
+  log("***************************************************************");
+
+  log("The connection is activated and can be used for the following",
+    " M3UA users:");
+  for (var integer index := 0; index < v_Table_Size; index := index + 1)
+  {
+    if (v_Table[index].commStatus == aSP_Active)
+    {
+      log("index: ",index,
+        ", ni: ",v_Table[index].single_M3UA_Entity_Data.ni,
+        ", sut_pc: ",v_Table[index].single_M3UA_Entity_Data.sut_pc,
+        ", tester_pc: ",v_Table[index].single_M3UA_Entity_Data.tester_pc,
+        ", destination: ",v_Table[index].single_M3UA_Entity_Data.destination_name,
+        ", TCP clientID: ",v_Table[index].tcp_client_id,
+        ", SCTP clientID: ",v_Table[index].sCTP_Assoc_ID
+      );
+      vl_ok_nr := vl_ok_nr +1;
+    }
+  }
+  if (vl_ok_nr == 0)
+  {
+    log("None of the connections is initialized.");
+  }
+  if (vl_ok_nr < v_Table_Size)
+  {
+    log("***************************************************************");
+    log("The connection is NOT ACIVATED YET for the following M3UA users:");
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if (v_Table[index].commStatus != aSP_Active)
+      {
+        log("index: ",index,
+          ", ni: ",v_Table[index].single_M3UA_Entity_Data.ni,
+          ", sut_pc: ",v_Table[index].single_M3UA_Entity_Data.sut_pc,
+          ", tester_pc: ",v_Table[index].single_M3UA_Entity_Data.tester_pc,
+          ", destination: ",v_Table[index].single_M3UA_Entity_Data.destination_name,
+          ", TCP clientID: ",v_Table[index].tcp_client_id,
+          ", SCTP clientID: ",v_Table[index].sCTP_Assoc_ID
+        );
+      }
+    }
+  }
+  else
+  {
+    log("Every connection (defined in config file) is initialized");
+  }
+  log("***************************************************************");
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function as_handleM3UA_timers
+// After  reception of SCTP_CommunicationUp's M3UA ASPUP/ASPAC is resent by the
+// entities that did not received ASPUP_Ack/ASPAC_Ack
+// List of (in)active users is shown periodically
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_handleM3UA_timers() runs on M3UA_SCTP_Daemon_CT
+{
+  [] T_Activation_timer.timeout
+  {
+    f_logActiveUsers();
+    if (tsp_logVerbose) {
+      T_Activation_timer.start;
+    }
+    repeat;
+  }
+
+  [] T_ASPUP_resend.timeout
+  {
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if ((v_Table[index].commStatus == aSP_Down_commUP_Received) or
+        (v_Table[index].commStatus == aSP_Down_ASPUP_Sent))
+      {
+        SCTP_PORT.send
+        (t_S_SCTP_Send
+          (v_Table[index].sCTP_Assoc_ID,
+            0, //    streamID
+            enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPUP(omit,omit))),
+            0, //?   context
+            tsp_SCTP_PayloadProtocolID
+          )
+        )
+
+        v_Table[index].commStatus := aSP_Down_ASPUP_Sent;
+        if (tsp_logVerbose)
+        {
+          log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+        }
+      }
+    }
+    T_ASPUP_resend.start;
+    repeat;
+  }
+
+  [] T_ASPAC_resend.timeout
+  {
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if ((v_Table[index].commStatus == aSP_Inactive) or
+        (v_Table[index].commStatus == aSP_Inact_ASPAC_Sent))
+      {
+        SCTP_PORT.send
+        (t_S_SCTP_Send
+          (v_Table[index].sCTP_Assoc_ID,
+            0, //    streamID
+            enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPAC(omit,omit,omit))),
+            0,
+            tsp_SCTP_PayloadProtocolID
+          )
+        )
+
+        v_Table[index].commStatus := aSP_Inact_ASPAC_Sent;
+        if (tsp_logVerbose)
+        {
+          log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+        }
+      }
+    }
+    T_ASPAC_resend.start;
+    repeat;
+  }
+  [tsp_Enable_M3UA_Heartbeat] T_Heartbeat.timeout
+  {
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if (v_Table[index].commStatus == aSP_Active)
+      {
+        SCTP_PORT.send
+        (t_S_SCTP_Send
+          (v_Table[index].sCTP_Assoc_ID,
+            0, //    streamID
+            enc_PDU_M3UA(valueof(t_PDU_M3UA_Heartbeat(omit))),
+            0,
+            tsp_SCTP_PayloadProtocolID
+          )
+        )
+
+        if (tsp_logVerbose)
+        {
+          log("Hearbeat sent to assoc: ", v_Table[index].sCTP_Assoc_ID);
+        }
+      }
+    }
+    T_Heartbeat.start;
+    repeat;
+  }
+}
+
+function f_find_index( in integer pl_tcp_asp_client_id) runs on M3UA_SCTP_Daemon_CT return integer
+{
+  var integer v_index_value := -1;
+  var integer v_TableSize := sizeof(v_Table);
+
+  if (tsp_All_SCTP_Data_To_TCP == false)// for backward compatibility
+  {
+    var integer search_index := 0;
+    while((search_index < v_TableSize) and (v_index_value == -1))
+    {
+      if(v_Table[search_index].tcp_client_id == pl_tcp_asp_client_id)
+      {v_index_value := search_index;}
+      search_index := search_index +1;
+    }
+  }
+  else
+  {
+    if (pl_tcp_asp_client_id <0) // dummy_tcp_client_id is less than 0
+    {
+      var integer search_index := 0;
+      while ((search_index < v_TableSize) and (v_index_value == -1))
+      {
+        if (v_Table[search_index].dummy_tcp_client_id == pl_tcp_asp_client_id)
+        {v_index_value := search_index;}
+        search_index := search_index +1;
+      }
+    }
+    else
+    {
+      var integer search_index := 0;
+      while ((search_index < v_TableSize) and (v_index_value == -1))
+      {
+        if (v_Table[search_index].tcp_client_id == pl_tcp_asp_client_id)
+        {v_index_value := search_index;}
+        search_index := search_index +1;
+      }
+    }
+  }
+  return v_index_value;
+}
+
+//==================================================================
+// MAIN Server function f_M3UA_SCTP_Daemon_Start
+//==================================================================
+function f_M3UA_SCTP_Daemon_Start() runs on M3UA_SCTP_Daemon_CT
+{
+  var ASP_TCP                vl_tcp_asp;
+  var MTP3_to_M3UAserver_msg vl_MTP3_to_M3UAserver_msg;
+  var integer     index;
+  var boolean     vl_error := false;
+  var boolean     vl_pause := false;
+  var boolean     vl_found_entry := false;
+
+  alt
+  {
+    //Message received from MTP3/M3UA
+    //+++++++++++++++++++++++++++++++
+    [] TCP_PORT.receive(ASP_TCP : ?) -> value vl_tcp_asp
+    {
+      //Decode received message
+      vl_MTP3_to_M3UAserver_msg := dec_MTP3_to_M3UAserver_msg(vl_tcp_asp.data);
+
+      //REGISTER message is received
+      if (ischosen (vl_MTP3_to_M3UAserver_msg.data.register))
+      {
+        //Compare with table data. Look at all entries in table
+        for (index := 0; index < v_Table_Size; index := index + 1)
+        {
+          if (
+            (v_Table[index].single_M3UA_Entity_Data.ni ==
+              vl_MTP3_to_M3UAserver_msg.data.register.ni)
+            and
+            (v_Table[index].single_M3UA_Entity_Data.sut_pc ==
+              vl_MTP3_to_M3UAserver_msg.data.register.sut_pc)
+            and
+            (v_Table[index].single_M3UA_Entity_Data.tester_pc ==
+              vl_MTP3_to_M3UAserver_msg.data.register.tester_pc)
+            and (
+              (v_Table[index].single_M3UA_Entity_Data.destination_name ==
+                vl_MTP3_to_M3UAserver_msg.data.register.entity)
+              // do not check if omit:
+              or (v_Table[index].single_M3UA_Entity_Data.destination_name == omit)
+            )
+          )// data matches
+          { // no client id in table yet -> register
+            vl_found_entry := true;
+            goto L_Register;   // preserve last index value
+          }
+        }
+        label L_Register;
+
+        if (vl_found_entry == false)
+        {
+          if (tsp_logVerbose)
+          {
+            log("Register data is not valid, it does not match data in",
+              " configuration file!");
+            log("Status msg with unsuccessful registration will be sent.");
+          }
+          vl_error := true;
+        }
+        else
+        {
+          if (ispresent(v_Table[index].tcp_client_id) )  //already registered
+          {
+            if (tsp_logVerbose)
+            {
+              log("A TCP connection already exists for this user, can not",
+                " register!");
+              log("Status msg with unsuccessful registration will be sent.");
+            }
+            vl_error := true;
+          }
+
+          if (v_Table[index].commStatus != aSP_Active ) //wrong state
+          {
+            if (tsp_logVerbose)
+            {
+              log("Register message arrived when M3UA is not in 'aSP_Active",
+                " state ");
+              log("Pause msg  will be sent.");
+            }
+            vl_pause := true;
+          }
+        }
+        if  (vl_error == false) //New M3UA client connected
+        {
+          v_Table[index].tcp_client_id := vl_tcp_asp.client_id;
+
+          log("REGISTER SUCCESSFUL message sent back");
+
+          v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType; // 4
+          v_MTP3_to_M3UAserver_msg_Status.data.status := reg_ok_status;  // 0
+
+          v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+          v_tcp_asp_Status.data :=
+          enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+          TCP_PORT.send(v_tcp_asp_Status);
+
+          if (vl_pause == true) {
+            log("PAUSE message sent back");
+
+            v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType; // 5
+            v_MTP3_to_M3UAserver_msg_Status.data.pause := SCTP_COMLOST_pause;  // 0
+
+            v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+            v_tcp_asp_Status.data :=
+            enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+            TCP_PORT.send(v_tcp_asp_Status);
+          }
+
+        }
+        else  //(vl_error == true)
+        {//If already registered in v_Table or no ASPACack is received or
+          //register data doesn't match table. Send UNSUCCESSFUL REGISTRATION
+          v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType;  // 4
+          v_MTP3_to_M3UAserver_msg_Status.data.status := reg_error_status;// 1
+
+          v_tcp_asp_Status.client_id := vl_tcp_asp.client_id;
+          v_tcp_asp_Status.data :=
+          enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+          TCP_PORT.send(v_tcp_asp_Status);
+          if (tsp_logVerbose)
+          {
+            log("Unsuccessful registration, message sent to ",
+              vl_tcp_asp.client_id);
+          }
+        }
+
+        vl_error := false;
+        vl_pause := false;
+        vl_found_entry := false;
+      }
+
+      //UNREGISTER message is received
+      else if (ischosen (vl_MTP3_to_M3UAserver_msg.data.unregister))
+      {
+        for (index := 0; index < v_Table_Size; index := index + 1)
+        {
+          if ( v_Table[index].tcp_client_id == vl_tcp_asp.client_id )
+          { // this shows it is registered
+            vl_found_entry := true;
+            goto L_Unregister;   // to preserve index value
+          }
+        }
+        label L_Unregister;
+
+        if (vl_found_entry == true) //Unregister message valid
+        {
+          //don't send ASPIA by deregistration, only status
+          log("UNREGISTER SUCCESSFUL message sent back");
+
+          v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType;  // 4
+          v_MTP3_to_M3UAserver_msg_Status.data.status := unreg_ok_status;// 2
+
+          v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+          v_tcp_asp_Status.data :=
+          enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+          TCP_PORT.send(v_tcp_asp_Status);
+
+          v_Table[index].tcp_client_id := omit; // unregister here
+        }
+        else   //Unregister message invalid. Send UNSUCCESSFUL UNREGISTRATION
+        {
+          if (tsp_logVerbose)
+          {
+            log("Not registered - can not unregister!");
+          }
+
+          v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType; // 4
+          v_MTP3_to_M3UAserver_msg_Status.data.status := unreg_error_status;// 3
+
+          v_tcp_asp_Status.client_id := vl_tcp_asp.client_id;
+          v_tcp_asp_Status.data :=
+          enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+          TCP_PORT.send(v_tcp_asp_Status);
+          if (tsp_logVerbose)
+          {
+            log("Unsuccessful unregistration, message sent to ",
+              vl_tcp_asp.client_id);
+          }
+        }
+        vl_found_entry := false;
+      }
+
+      //TRANSFER_REQ message is received
+      else if (ischosen (vl_MTP3_to_M3UAserver_msg.data.transfer_req))
+      {
+        index := f_find_index(vl_tcp_asp.client_id);
+
+        if(index != -1)
+        {// this shows it is registered with M3UA or has a dummy_tcp_client_id
+          vl_found_entry := true;
+
+          if (v_Table[index].commStatus == aSP_Active)
+          { // this shows we are in the state to handle transfer msgs
+            if (tsp_SCTP_PayloadProtocolID == 3) { // M3UA
+              //call S_SCTP_Send SCTP enc(M3UA DATA)
+              SCTP_PORT.send
+              (t_S_SCTP_Send
+                (v_Table[index].sCTP_Assoc_ID,
+                  1,    //streamID
+                  enc_PDU_M3UA(valueof
+                    (t_M3UA_DATA
+                      (omit,    //network_Appearance
+                        omit,    //routing_Context
+                        t_M3UA_Protocol_Data //data
+                        (  //OPC -> 4 octets
+                          int2oct
+                          (vl_MTP3_to_M3UAserver_msg.data.transfer_req.opc,4),
+                          //DPC -> 4 octets
+                          int2oct
+                          (vl_MTP3_to_M3UAserver_msg.data.transfer_req.dpc,4),
+                          //SIO
+                          bit2oct('0000'B &
+                            vl_MTP3_to_M3UAserver_msg.data.transfer_req.sio.si),
+                          bit2oct('000000'B &
+                            vl_MTP3_to_M3UAserver_msg.data.transfer_req.sio.ni),
+                          bit2oct('000000'B &
+                            vl_MTP3_to_M3UAserver_msg.data.transfer_req.sio.prio),
+                          //SLS
+                          int2oct
+                          (vl_MTP3_to_M3UAserver_msg.data.transfer_req.sls,1),
+                          //Data
+                          vl_MTP3_to_M3UAserver_msg.data.transfer_req.data
+                        ),
+                        omit    //correlation_ID
+                      ))),
+                  0, //?  context
+                  tsp_SCTP_PayloadProtocolID
+                )
+              )
+            } else { // Non M3UA is transferred tranparently
+              SCTP_PORT.send
+              (t_S_SCTP_Send
+                (v_Table[index].sCTP_Assoc_ID,
+                  1,    //streamID
+                  vl_MTP3_to_M3UAserver_msg.data.transfer_req.data,
+                  0, //?  context
+                  tsp_SCTP_PayloadProtocolID
+                )
+              )
+            }
+            if(tsp_logVerbose)
+            {
+              log("Transfer_Req received, Message sent via SCTP");
+            }
+          }
+          else
+          { //NOT in the state aSP_Active, can not handle transfer msgs
+            //Send ERROR STATUS message
+            v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType; // 4
+            v_MTP3_to_M3UAserver_msg_Status.data.status := send_error_status;// 5
+
+            v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+            v_tcp_asp_Status.data :=
+            enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+            TCP_PORT.send(v_tcp_asp_Status);
+            //v_Table[index].tcp_client_id := omit;  // unregister here
+
+            if(tsp_logVerbose)
+            {
+              log("Transfer_Req received in an inactive state",
+                " -> ERROR message sent back");
+            }
+          }
+          index := v_Table_Size;  // end searching in table
+        }
+
+        if (vl_found_entry == false)
+        { //No matching client ID in Table -> not registered
+          //Send ERROR STATUS message
+          v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType;  // 4
+          v_MTP3_to_M3UAserver_msg_Status.data.status := send_error_status;// 5
+
+          v_tcp_asp_Status.client_id := vl_tcp_asp.client_id;
+          v_tcp_asp_Status.data :=
+          enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+          TCP_PORT.send(v_tcp_asp_Status);
+
+          if (tsp_logVerbose)
+          {
+            log("Transfer_Req received from an unregistered client",
+              " -> ERROR message sent back");
+          }
+        }
+
+        vl_found_entry := false;
+      } //end ifchosen transfer_req
+
+      //STATUS with kill (for future)
+      else if (ischosen (vl_MTP3_to_M3UAserver_msg.data.status))
+      {
+        if (vl_MTP3_to_M3UAserver_msg.data.status == kill_status ) // 255
+        {
+          for (index := 0; index < v_Table_Size; index := index + 1)
+          {
+            SCTP_PORT.send
+            (t_S_SCTP_Send
+              (v_Table[index].sCTP_Assoc_ID,
+                0,
+                enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPDN)),
+                0,
+                tsp_SCTP_PayloadProtocolID
+              ))
+          }
+          T_timer.start(2.0);
+          T_timer.timeout;
+          return;
+        }
+      }
+      else if (tsp_logVerbose)
+      {
+        log("Unexpected message received from a MTP3 test port.");
+      }
+      repeat;
+    }  // end receive
+
+    //Message received from SCTP Test Port
+    //+++++++++++++++++++++++++++++++
+    [] as_SCTP_DataArrive();
+
+    [] as_handleM3UA_timers();
+
+    [] as_handleSCTP_timers();
+
+    [] as_SCTP_Connected(); // late connect messages
+
+    // step for handling SCTP_CommunicationUp calls which arrive late
+    [] as_SCTP_CommunicationUp();
+
+    //step for handling unexpected SCTP-side errors, and reporting
+    //them to the MTP3-side
+    [] as_Unexpected_SCTP_Events();
+
+    //Message received from TCP Test Port
+    //+++++++++++++++++++++++++++++++
+    [] as_Unexpected_TCP_Events();
+
+  }  // end alt
+
+} // end of function  f_M3UA_SCTP_Daemon_Start
+
+function f_handle_nonM3UA_msg(octetstring pl_PDU,
+  integer pl_index) runs on M3UA_SCTP_Daemon_CT{
+  if ((v_Table[pl_index].commStatus == aSP_Active) and
+    ispresent(v_Table[pl_index].tcp_client_id))
+  {
+    //send TRANSFER_IND message
+    var MTP3_to_M3UAserver_msg
+    vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd;
+    var ASP_TCP vl_tcp_asp_MTP3_TRANSFERind;
+
+    vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd.msgType := transfer_ind_msgType; // 0
+
+    vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd.data.transfer_ind :=
+    (valueof
+      (tr_ASP_MTP3_TRANSFERind_sio
+        (            //sio
+          '00'B,
+          '00'B,
+          '0000'B,
+          //opc,dpc,sls
+          0,
+          0,
+          0,
+          //data
+          pl_PDU
+        )))
+
+    vl_tcp_asp_MTP3_TRANSFERind.client_id :=
+    v_Table[pl_index].tcp_client_id;
+    vl_tcp_asp_MTP3_TRANSFERind.data :=
+    enc_MTP3_to_M3UAserver_msg
+    (vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd);
+
+    TCP_PORT.send(vl_tcp_asp_MTP3_TRANSFERind);
+    if(tsp_logVerbose)
+    {
+      log("Non-M3UA DATA received, TRANSFERind sent");
+    }
+  }
+  else
+  {
+    if(tsp_logVerbose)
+    {
+      log("DATA received. No user connected, message discarded");
+    }
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_handle_M3UA_msg
+// It handles the M3UA message received from SUT
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_handle_M3UA_msg(PDU_M3UA pl_PDU_M3UA,integer pl_assoc_Id,
+  integer pl_index) runs on M3UA_SCTP_Daemon_CT
+{
+
+  //DATA received.
+  if (ischosen (pl_PDU_M3UA.m3UA_DATA))
+  {
+    if (v_Table[pl_index].commStatus == aSP_Active)
+    {
+      //send TRANSFER_IND message
+      var MTP3_to_M3UAserver_msg
+      vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd;
+      var ASP_TCP vl_tcp_asp_MTP3_TRANSFERind;
+
+      vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd.msgType := transfer_ind_msgType; // 0
+
+      vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd.data.transfer_ind :=
+      (valueof
+        (tr_ASP_MTP3_TRANSFERind_sio
+          (            //sio
+            substr(oct2bit(pl_PDU_M3UA.m3UA_DATA.
+                messageParameters.protocol_Data.nI),6,2),
+            substr(oct2bit(pl_PDU_M3UA.m3UA_DATA.
+                messageParameters.protocol_Data.mP),6,2),
+            substr(oct2bit(pl_PDU_M3UA.m3UA_DATA.
+                messageParameters.protocol_Data.sI),4,4),
+            //opc,dpc,sls
+            oct2int(pl_PDU_M3UA.m3UA_DATA.messageParameters.
+              protocol_Data.oPC),
+            oct2int(pl_PDU_M3UA.m3UA_DATA.messageParameters.
+              protocol_Data.dPC),
+            oct2int(pl_PDU_M3UA.m3UA_DATA.messageParameters.
+              protocol_Data.sLS),
+            //data
+            pl_PDU_M3UA.m3UA_DATA.messageParameters.
+            protocol_Data.userProtocolData
+          )))
+
+      if(tsp_All_SCTP_Data_To_TCP == false)  // backward compatibility
+      {
+        if (ispresent(v_Table[pl_index].tcp_client_id))
+        {
+          vl_tcp_asp_MTP3_TRANSFERind.client_id :=
+          v_Table[pl_index].tcp_client_id;
+
+          vl_tcp_asp_MTP3_TRANSFERind.data :=
+          enc_MTP3_to_M3UAserver_msg
+          (vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd);
+
+          TCP_PORT.send(vl_tcp_asp_MTP3_TRANSFERind);
+          if(tsp_logVerbose)
+          {
+            log("DATA received, TRANSFERind sent");
+          }
+        }
+        else
+        {
+          if(tsp_logVerbose)
+          {
+            log("DATA received. No user connected, message discarded");
+          }
+        }
+      }
+      else  // send data to TCP_PORT even if user is not registered
+      {
+        if( ispresent(v_Table[pl_index].tcp_client_id) )
+        {
+          vl_tcp_asp_MTP3_TRANSFERind.client_id :=
+          v_Table[pl_index].tcp_client_id;
+        }
+        else
+        {
+          vl_tcp_asp_MTP3_TRANSFERind.client_id :=
+          v_Table[pl_index].dummy_tcp_client_id;
+        }
+
+        vl_tcp_asp_MTP3_TRANSFERind.data :=
+        enc_MTP3_to_M3UAserver_msg( vl_MTP3_to_M3UAserver_msg_MTP3_TransferInd );
+
+        TCP_PORT.send(vl_tcp_asp_MTP3_TRANSFERind);
+
+        if(tsp_logVerbose)
+        {
+          log("DATA received, TRANSFERind sent");
+        }
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("DATA received. Not in ASP_ACTIVE state, message discarded")
+      }
+    }
+  }
+  //ASPAC_ACK received.
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPAC_Ack))
+  {
+    if ( (v_Table[pl_index].commStatus == aSP_Inact_ASPAC_Sent) or
+      (v_Table[pl_index].commStatus == aSP_Active) )
+    {
+      if ( (ispresent(v_Table[pl_index].tcp_client_id)) and
+        (v_Table[pl_index].commStatus == aSP_Inact_ASPAC_Sent) ) {
+        // send resume message:
+        v_MTP3_to_M3UAserver_msg_Status.msgType := resume_msgType;  // 6
+        v_MTP3_to_M3UAserver_msg_Status.data.resume := ok_resume; // 0
+
+        v_tcp_asp_Status.client_id := v_Table[pl_index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        if(tsp_logVerbose)
+        {
+          log("RESUME sent to user.");
+        }
+      }
+      v_Table[pl_index].commStatus := aSP_Active;
+
+      if (tsp_logVerbose)
+      {
+        log("ASPAC_Ack received for association #",pl_assoc_Id);
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("ASPAC_Ack received in wrong state on association #",
+          pl_assoc_Id);
+      }
+    }
+  }
+  //BEAT received.
+  else if (ischosen (pl_PDU_M3UA.m3UA_BEAT))
+  {
+    if (v_Table[pl_index].commStatus == aSP_Active)
+    {
+      // Send heartbeat ACK
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA(valueof
+            (t_PDU_M3UA_Beat_Ack
+              (pl_PDU_M3UA.m3UA_BEAT.messageParameters.heartbeat_Data)
+            )),
+          0, //? context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+
+      if(tsp_logVerbose)
+      {
+        log("BEAT received. BEAT ACK sent.");
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("BEAT received in wrong state.")
+      }
+    }
+  }
+  // MGMT Class messages
+  else if (ischosen (pl_PDU_M3UA.m3UA_ERR))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_ERR   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_NOTIFY))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_NOTIFY   ----   discarded");
+    }
+  }
+  // SSNM Class messages
+  else if (ischosen (pl_PDU_M3UA.m3UA_DUNA))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DUNA   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DAVA))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DAVA   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DAUD))
+  {
+    if (   (v_Table[pl_index].commStatus == aSP_Inactive)
+      or(v_Table[pl_index].commStatus == aSP_Inact_ASPAC_Sent)
+      or(v_Table[pl_index].commStatus == aSP_Active)
+    )
+    {
+      // Send DAVA
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA
+          (valueof
+            (t_PDU_M3UA_DAVA
+              (pl_PDU_M3UA.m3UA_DAUD.messageParameters.
+                network_Appearance,
+                pl_PDU_M3UA.m3UA_DAUD.messageParameters.
+                routing_Context,
+                pl_PDU_M3UA.m3UA_DAUD.messageParameters.
+                affected_Point_Codes,
+                pl_PDU_M3UA.m3UA_DAUD.messageParameters.
+                info_String
+              ))),
+          0, //?   context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+      if(tsp_logVerbose)
+      {
+        log("DAUD received. DAVA sent.");
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("DAUD received in wrong state");
+      }
+    }
+  }
+  else  if (ischosen (pl_PDU_M3UA.m3UA_SCON))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_SCON   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DUPU))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DUPU   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DRST))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DRST   ----   discarded");
+    }
+  }
+  // ASPSM Class messages
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPUP))
+  {
+    if ( (v_Table[pl_index].commStatus == aSP_Down_commUP_Received) or
+      (v_Table[pl_index].commStatus == aSP_Down_ASPUP_Sent) )
+    {
+      v_Table[pl_index].commStatus := aSP_Inactive;
+
+      if (tsp_logVerbose)
+      {
+        log("M3UA_ASPUP received and ASPUP_Ack sent.");
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+      // Send ASPUP_ACK
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPUP_Ack)),
+          0, //?   context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+
+      if(ispresent(v_Table[pl_index].single_M3UA_Entity_Data.destination_name))
+      {
+        if(f_isEntityOnTheList(v_Table[pl_index].single_M3UA_Entity_Data.destination_name))
+        {
+          f_sync_sendPhaseDone();
+        }
+      }
+      else
+      {
+        f_warning("destination_name field is empty in 'tsp_Total_M3UA_Entities_Data' - no SYNC ACK sent");
+      }
+
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("ASPUP received in wrong state");
+      }
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPDN))
+  {
+    if (   (v_Table[pl_index].commStatus == aSP_Inactive)
+      or(v_Table[pl_index].commStatus == aSP_Inact_ASPAC_Sent)
+      or(v_Table[pl_index].commStatus == aSP_Active)
+    )
+    {
+      // Send ASPDN_ACK
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA(valueof(t_PDU_M3UA_ASPDN_Ack)),
+          0, //?   context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+      if (ispresent(v_Table[pl_index].tcp_client_id) and
+        (v_Table[pl_index].commStatus == aSP_Active))
+      {
+        // send pause to user
+        v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType; // 5
+        v_MTP3_to_M3UAserver_msg_Status.data.pause := M3UA_ASPDN_pause;  // 1
+
+        v_tcp_asp_Status.client_id := v_Table[pl_index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        //v_Table[pl_index].tcp_client_id := omit;  // unregister here
+        if(tsp_logVerbose)
+        {
+          log("PAUSE sent to user.");
+        }
+      }
+
+      //set back to the state before ASPUP is sent
+      v_Table[pl_index].commStatus := aSP_Down_commUP_Received;
+      if (tsp_logVerbose)
+      {
+        log("M3UA_ASPDN received, ASPDN ACK sent");
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("ASPDN received in wrong state");
+      }
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_BEAT_Ack))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_BEAT_Ack   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPUP_Ack))
+  {
+    if ( (v_Table[pl_index].commStatus == aSP_Down_ASPUP_Sent) or
+      (v_Table[pl_index].commStatus == aSP_Inactive) )
+    {
+      v_Table[pl_index].commStatus := aSP_Inactive;
+
+      if (tsp_logVerbose)
+      {
+        log("ASPUP_Ack received. Send ASPAC.");
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+      //ASPAC message sent
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,
+          enc_PDU_M3UA(valueof
+            (t_PDU_M3UA_ASPAC
+              (omit,//override'01'O, loadshare'02'O, mixed'03'O??
+                omit,
+                omit
+              ))),
+          0,
+          tsp_SCTP_PayloadProtocolID
+        ))
+
+      action("Testing: v_Table ", log2str(v_Table));
+      action("Testing: v_M3UA_Entities_ASPUP_waitList ", log2str(v_M3UA_Entities_ASPUP_waitList));
+      if(ispresent(v_Table[pl_index].single_M3UA_Entity_Data.destination_name))
+      {
+        if(f_isEntityOnTheList(v_Table[pl_index].single_M3UA_Entity_Data.destination_name))
+        {
+          f_sync_sendPhaseDone();
+        }
+      }
+      else
+      {
+        f_warning("destination_name field is empty in 'tsp_Total_M3UA_Entities_Data' - no SYNC ACK sent");
+      }
+
+      v_Table[pl_index].commStatus := aSP_Inact_ASPAC_Sent;
+      if (tsp_logVerbose)
+      {
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("ASPUP_Ack received in wrong state");
+      }
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPDN_Ack))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_ASPDN_Ack   ----   discarded");
+    }
+  }
+  // ASPTM Class messages
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPAC))
+  {
+    if ( (v_Table[pl_index].commStatus == aSP_Inactive) or
+      (v_Table[pl_index].commStatus == aSP_Inact_ASPAC_Sent) )
+    {
+      v_Table[pl_index].commStatus := aSP_Active;
+
+      if(tsp_logVerbose)
+      {
+        log("ASPAC received. ASPAC ACK sent.");
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+      // Send ASPAC_ACK
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA
+          (valueof
+            (t_PDU_M3UA_ASPAC_Ack
+              (pl_PDU_M3UA.m3UA_ASPAC.messageParameters.traffic_Mode_Type,
+                pl_PDU_M3UA.m3UA_ASPAC.messageParameters.routing_Context
+              ))),
+          0, //?   context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+      if (ispresent(v_Table[pl_index].tcp_client_id)) {
+        // send resume message:
+        v_MTP3_to_M3UAserver_msg_Status.msgType := resume_msgType;  // 6
+        v_MTP3_to_M3UAserver_msg_Status.data.resume := ok_resume; // 0
+
+        v_tcp_asp_Status.client_id := v_Table[pl_index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        if(tsp_logVerbose)
+        {
+          log("RESUME sent to user.");
+        }
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("ASPAC received in wrong state");
+      }
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPIA))
+  {
+    if  (v_Table[pl_index].commStatus == aSP_Active)
+    {
+      // Send ASPIA_ACK
+      SCTP_PORT.send
+      (t_S_SCTP_Send
+        (v_Table[pl_index].sCTP_Assoc_ID,
+          0,    //streamID
+          enc_PDU_M3UA
+          (valueof
+            (t_PDU_M3UA_ASPIA_Ack(pl_PDU_M3UA.m3UA_ASPIA.
+                messageParameters.routing_Context)
+            )),
+          0, //?   context
+          tsp_SCTP_PayloadProtocolID
+        )
+      )
+      if (ispresent(v_Table[pl_index].tcp_client_id) )
+      { //(comStatus is always active here)
+        // send pause to user
+        v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType;  // 5
+        v_MTP3_to_M3UAserver_msg_Status.data.pause := M3UA_ASPIA_pause;  // 2
+
+        v_tcp_asp_Status.client_id := v_Table[pl_index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        //v_Table[pl_index].tcp_client_id := omit;  // unregister here
+        if(tsp_logVerbose)
+        {
+          log("PAUSE sent to user.");
+        }
+      }
+      //set to the state before ASPAC is sent (aSP_Inactive)
+      v_Table[pl_index].commStatus := aSP_Inactive;
+      if (tsp_logVerbose)
+      {
+        log("ASPIA received. ASPIA ACK sent.");
+        log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " State changed to : ",v_Table[pl_index].commStatus );
+      }
+    }
+    else
+    {
+      if(tsp_logVerbose)
+      {
+        log("ASPIA received in wrong state");
+      }
+    }
+  }
+  //ASPIA_ACK received.
+  else if (ischosen (pl_PDU_M3UA.m3UA_ASPIA_Ack))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_ASPIA_Ack   ----   discarded");
+    }
+  }
+  // RKM Class messages
+  else if (ischosen (pl_PDU_M3UA.m3UA_REG_REQ))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_REG_REQ   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_REG_RSP))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_REG_RSP   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DEREG_REQ))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DEREG_REQ   ----   discarded");
+    }
+  }
+  else if (ischosen (pl_PDU_M3UA.m3UA_DEREG_RSP))
+  {
+    // will be discarded! Log arrival if you want.
+    if (tsp_logVerbose)
+    {
+      log("Received M3UA_DEREG_RSP   ----   discarded");
+    }
+  }
+}
+
+//////////////////////////////////////
+//  SCTP related definitions
+//////////////////////////////////////
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// SCTP templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+template ASP_SCTP t_S_SCTP_Send
+( in  template integer       pl_associationID,
+  in  template integer       pl_streamID,
+  in  template octetstring   pl_userData,
+  in  template integer       pl_context,
+  in  template integer       pl_protocolID ) :=
+{
+  client_id := pl_associationID,
+  sinfo_stream      := pl_streamID,
+  //context       := pl_context,
+  sinfo_ppid    := pl_protocolID,
+  data      := pl_userData
+}
+
+template ASP_SCTP_SEND_FAILED t_ASP_SCTP_SEND_FAILED
+( in  template integer       pl_streamID) :=
+{
+  client_id := pl_streamID
+}
+
+template ASP_SCTP_Listen t_ASP_SCTP_Listen
+(
+  template charstring pl_local_hostname,
+  template integer pl_local_portnumber
+) :=
+{
+  local_hostname := pl_local_hostname,
+  local_portnumber := pl_local_portnumber
+}
+
+template ASP_SCTP_Connected tr_ASP_SCTP_Connected (
+  template integer     pl_client_id,
+  template charstring  pl_local_hostname,
+  template integer     pl_local_portnumber,
+  template charstring  pl_peer_hostname,
+  template integer     pl_peer_portnumber
+) :=
+{
+  client_id := pl_client_id,
+  local_hostname := pl_local_hostname,
+  local_portnumber := pl_local_portnumber,
+  peer_hostname := pl_peer_hostname,
+  peer_portnumber := pl_peer_portnumber
+}
+
+template ASP_SCTP_ConnectFrom t_ASP_SCTP_ConnectFrom
+(
+  template charstring pl_local_hostname,
+  template integer pl_local_portnumber,
+  template charstring pl_peer_hostname,
+  template integer pl_peer_portnumber
+) :=
+{
+  local_hostname := pl_local_hostname,
+  local_portnumber := pl_local_portnumber,
+  peer_hostname := pl_peer_hostname,
+  peer_portnumber := pl_peer_portnumber
+}
+
+template ASP_SCTP_RESULT t_ASP_SCTP_RESULT(
+  template integer pl_client_id,
+  template boolean pl_error_status,
+  template charstring pl_error_message
+) :=
+{
+  client_id := pl_client_id,
+  error_status := pl_error_status,
+  error_message := pl_error_message
+}
+
+template ASP_SCTP_ASSOC_CHANGE tr_S_SCTP_CommunicationUp
+( in  template integer           pl_associationID ) :=
+{
+  client_id          := pl_associationID,
+  sac_state          := SCTP_COMM_UP
+}
+
+
+template ASP_SCTP tr_S_SCTP_DataArrive
+( in template integer      pl_associationID,
+  in template integer      pl_streamID,
+  in template integer      pl_protocolID,
+  in template PDU_SCTP     pl_data ) :=
+{
+  client_id    := pl_associationID,
+  sinfo_stream := pl_streamID,
+  sinfo_ppid   := pl_protocolID,
+  data         := pl_data
+}
+
+template ASP_SCTP_ASSOC_CHANGE tr_S_SCTP_CommunicationLost
+( in  template integer           pl_associationID ) :=
+{
+  client_id          := pl_associationID,
+  sac_state          := SCTP_COMM_LOST
+}
+
+template ASP_SCTP_ASSOC_CHANGE tr_S_SCTP_ShutdownComplete
+( in template integer              pl_associationID ) :=
+{
+  client_id          := pl_associationID,
+  sac_state          := SCTP_SHUTDOWN_COMP
+}
+
+template ASP_SCTP_SHUTDOWN_EVENT tr_S_SCTP_ShutdownEvent
+( in template integer              pl_associationID ) :=
+{
+  client_id          := pl_associationID
+}
+
+template ASP_SCTP_ASSOC_CHANGE tr_S_SCTP_Restart
+( in template integer              pl_associationID ) :=
+{
+  client_id          := pl_associationID,
+  sac_state          := SCTP_RESTART
+}
+
+template ASP_SCTP_ASSOC_CHANGE tr_S_SCTP_CANT_STR_ASSOC
+( in template integer              pl_associationID ) :=
+{
+  client_id          := pl_associationID,
+  sac_state          := SCTP_CANT_STR_ASSOC
+}
+
+template ASP_SCTP_Close t_ASP_SCTP_Close
+( in template integer              pl_associationID ) :=
+{
+  client_id          := pl_associationID
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// end of SCTP templates
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Initialize_SCTP
+// Initialize the SCTP layer with parameters read from the configuration file
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Initialize_SCTP() runs on M3UA_SCTP_Daemon_CT
+{
+  for (var integer vl_i := 0; vl_i < v_Table_Size; vl_i := vl_i + 1)
+  {
+    v_Table[vl_i].commStatus := aSP_Down_sCTP_Initialize_Done;
+    if (tsp_SCTP_Server_Mode) {
+      f_Initialize(vl_i);  //send out LISTEN messages
+    } else {
+      //Send ConnectFrom SEQUENTIALLY, wait for RESULT messages
+      f_Associate(vl_i);
+
+      if( tsp_All_SCTP_Data_To_TCP )
+      {
+        v_Next_Dummy_TCP_client_id := v_Next_Dummy_TCP_client_id -1;
+        v_Table[vl_i].dummy_tcp_client_id := v_Next_Dummy_TCP_client_id;
+      }
+    }
+  }
+
+  T_Assoc_restart.start;
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_AssocData_check
+// Check if the association data from config file is correct
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_AssocData_check(in SCTP_Assocation_Address pl_addr,
+  integer pl_size) runs on M3UA_SCTP_Daemon_CT
+{
+  if(pl_addr.remote_ip_addr == "")
+  {
+    log("For every association the remote IP address should be",
+      " defined in tsp_Total_M3UA_Entities_Data.");
+    setverdict(fail);
+    unmap(self:SCTP_PORT, system:SCTP_PORT);
+    return;
+  }
+
+  if (tsp_SCTP_Server_Mode)
+  {
+    for (var integer vl_i := 0; vl_i < pl_size; vl_i := vl_i + 1)
+    {
+      if((pl_addr.remote_ip_addr == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.remote_ip_addr) and
+        (pl_addr.remote_sctp_port == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.remote_sctp_port) and
+        (pl_addr.local_ip_addr == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.local_ip_addr) and
+        (pl_addr.local_sctp_port == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.local_sctp_port))
+      {
+        log("The remote and local IP_address&port is identical for two associations.");
+        setverdict(fail);
+        unmap(self:SCTP_PORT, system:SCTP_PORT);
+        break;
+      }
+    }
+  } else {
+    for (var integer vl_i := 0; vl_i < pl_size; vl_i := vl_i + 1)
+    {
+      if( (pl_addr.local_ip_addr == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.local_ip_addr)
+        and (pl_addr.local_sctp_port == v_Table[vl_i].single_M3UA_Entity_Data.
+          assoc.local_sctp_port))
+      {
+        log("The local IP address and port is identical for two associations in SCTP client mode.");
+        setverdict(fail);
+        unmap(self:SCTP_PORT, system:SCTP_PORT);
+        break;
+      }
+    }
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Initialize
+// Initialize SCTP connection for a M3UA entity
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Initialize (in integer pl_index) runs on M3UA_SCTP_Daemon_CT
+{
+  for (var integer index := 0; index < pl_index; index := index + 1)
+  {
+    if((v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_sctp_port ==
+        v_Table[index].single_M3UA_Entity_Data.assoc.local_sctp_port) and
+      (v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_ip_addr ==
+        v_Table[index].single_M3UA_Entity_Data.assoc.local_ip_addr))
+    {
+      return; // do not need to send LISTEN
+    }
+  }
+
+  SCTP_PORT.send
+  (t_ASP_SCTP_Listen
+    (v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_ip_addr,
+      v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_sctp_port
+    )
+  );
+
+  // comstatus not changed!
+
+}   // end of function
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Associate
+// Associate SCTP connection  for a M3UA entity
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Associate(in integer pl_index) runs on M3UA_SCTP_Daemon_CT
+{
+  SCTP_PORT.send
+  (t_ASP_SCTP_ConnectFrom
+    (v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_ip_addr,
+      v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_sctp_port,
+      v_Table[pl_index].single_M3UA_Entity_Data.assoc.remote_ip_addr,
+      v_Table[pl_index].single_M3UA_Entity_Data.assoc.remote_sctp_port
+    )
+  )
+
+  T_timer.start;
+
+  alt
+  {
+    [] SCTP_PORT.receive( t_ASP_SCTP_RESULT (*,?,*) )
+    -> value v_ASP_SCTP_RESULT
+    {
+      if (v_ASP_SCTP_RESULT.error_status) {
+        log("Connect failed: ", v_ASP_SCTP_RESULT.error_message);
+      } else {
+        v_assocID := v_ASP_SCTP_RESULT.client_id;
+        v_Table[pl_index].sCTP_Assoc_ID := v_assocID;
+        v_Table[pl_index].commStatus := aSP_Down_sCTP_Associate_done;
+        log ("SCTP_ConnecResult -- Connection established from: ",
+          v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_ip_addr, ":",
+          v_Table[pl_index].single_M3UA_Entity_Data.assoc.local_sctp_port,
+          " to server: ",
+          v_Table[pl_index].single_M3UA_Entity_Data.assoc.remote_ip_addr, ":",
+          v_Table[pl_index].single_M3UA_Entity_Data.assoc.remote_sctp_port,
+          " Assoc Id: ", v_assocID, " index: ", pl_index);
+        if (tsp_logVerbose)
+        {
+          log("Association: #", v_Table[pl_index].sCTP_Assoc_ID, " Index: #", pl_index, " State changed to : ",v_Table[pl_index].commStatus);
+        }
+      }
+      // needed to make reconnect faster
+      T_timer.start(0.1); T_timer.timeout;
+      T_timer.stop;
+    }
+
+    [] T_timer.timeout
+    {
+      log("--------------------------------------------------------------");
+      log("No response received to t_ASP_SCTP_ConnectFrom, index =", pl_index);
+      log("--------------------------------------------------------------");
+      setverdict(fail);
+      //        unmap(self:SCTP_PORT, system:SCTP_PORT);
+    }
+
+    [] as_SCTP_CommunicationUp();
+
+    [] as_SCTP_DataArrive();
+
+    [] as_SCTP_Connected();
+
+    [] as_Unexpected_SCTP_Events();
+
+  } //end of alt
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_Assoc_Exists
+// It test if an association with ID=assocID exists in the table
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_Assoc_Exists(integer assocID) runs on M3UA_SCTP_Daemon_CT return integer
+{
+  for (var integer index := 0; index < v_Table_Size; index := index + 1)
+  {
+    if (v_Table[index].sCTP_Assoc_ID == assocID) // user found
+    {
+      return index;
+    }
+  }
+  if (tsp_logVerbose)
+  {
+    log("Association not Found: ", assocID);
+  }
+  return -1;
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_SCTP_DataArrive
+// This altstep handles the data received from SCTP
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_SCTP_DataArrive() runs on M3UA_SCTP_Daemon_CT
+{
+  //DataArrive-notification received
+  [] SCTP_PORT.receive(tr_S_SCTP_DataArrive
+    (?,  //associationID
+      ?,  //streamID
+      ?,  //protocolID
+      ?   //data
+    )) -> value v_ASP_SCTP;
+  {
+    v_assocID := v_ASP_SCTP.client_id;
+    v_streamID := v_ASP_SCTP.sinfo_stream;
+    v_msgLength := lengthof(v_ASP_SCTP.data);
+    v_data := v_ASP_SCTP.data;
+    var integer index := f_Assoc_Exists(v_assocID);
+    if ( index != -1 )
+    {
+      if (tsp_logVerbose)
+      {
+        log("Message Received on Assoc: ", v_assocID, " index: ", index );
+      }
+      if (tsp_SCTP_PayloadProtocolID == 3) { // M3UA
+        v_PDU_M3UA := dec_PDU_M3UA(v_data);
+        f_handle_M3UA_msg(v_PDU_M3UA,v_assocID,index);
+      } else { // non-M3UA is transferred transparently
+        f_handle_nonM3UA_msg(v_data,index);
+      }
+    }
+    else
+    {
+      log ("Message Received on unknown assoc: ", v_assocID, " Closing connection");
+      // this should be in as_SCTP_CommunicationUp, but kernel fails
+      // Connection is closed at the first data received
+      SCTP_PORT.send(t_ASP_SCTP_Close(v_assocID));
+      log ("SCTP Connection closed.");
+    }
+    repeat;
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_SCTP_Send_Failed
+// Handle the Send Failed message
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_SCTP_Send_Failed() runs on M3UA_SCTP_Daemon_CT
+{
+  [] SCTP_PORT.receive(t_ASP_SCTP_SEND_FAILED ( ? ))
+  -> value v_ASP_SCTP_SEND_FAILED
+  {
+    v_assocID := v_ASP_SCTP_SEND_FAILED.client_id;
+    log ("SCTP_Send -- Failed for assoc:", v_assocID, ".");
+    var integer index := f_Assoc_Exists(v_assocID);
+    if ( index != -1 )
+    {
+      //Send ERROR STATUS message
+      v_MTP3_to_M3UAserver_msg_Status.msgType := status_msgType; // 4
+      v_MTP3_to_M3UAserver_msg_Status.data.status := send_error_status;// 5
+
+      v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+      v_tcp_asp_Status.data :=
+      enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+      TCP_PORT.send(v_tcp_asp_Status);
+      if (tsp_logVerbose)
+      {
+        log("Send Failed msg sent to user with Assoc: ", v_assocID, " index: ", index );
+      }
+    }
+    else
+    {
+      log ("Send error received for association that does not exist");
+    }
+    repeat;
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_SCTP_Connected
+// Handle the SCTP connected  Messages
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_SCTP_Connected() runs on M3UA_SCTP_Daemon_CT
+{
+  [] SCTP_PORT.receive(tr_ASP_SCTP_Connected ( ?, ?, ?, ?, ? ))
+  -> value v_ASP_SCTP_Connected
+  {
+    v_assocID := v_ASP_SCTP_Connected.client_id;
+
+    //search assoc:
+
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if((v_ASP_SCTP_Connected.local_portnumber ==
+          v_Table[index].single_M3UA_Entity_Data.assoc.local_sctp_port) and
+        (v_ASP_SCTP_Connected.local_hostname ==
+          v_Table[index].single_M3UA_Entity_Data.assoc.local_ip_addr) and
+        (v_ASP_SCTP_Connected.peer_portnumber ==
+          v_Table[index].single_M3UA_Entity_Data.assoc.remote_sctp_port) and
+        (v_ASP_SCTP_Connected.peer_hostname ==
+          v_Table[index].single_M3UA_Entity_Data.assoc.remote_ip_addr)
+
+      )
+      {
+        v_Table[index].sCTP_Assoc_ID := v_assocID;
+        v_Table[index].commStatus := aSP_Down_sCTP_Associate_done;
+        log ("SCTP_Connected -- Accepted connection from client: ",
+          v_ASP_SCTP_Connected.peer_hostname, ":", v_ASP_SCTP_Connected.peer_portnumber,
+          " on server: ",
+          v_ASP_SCTP_Connected.local_hostname, ":", v_ASP_SCTP_Connected.local_portnumber,
+          " Assoc Id: ", v_assocID, " index: ", index);
+        index := v_Table_Size; //end cycle
+        v_assocID := -1; // client is known
+      }
+    }
+
+    if (v_assocID != -1) {
+      log ("SCTP_Connected -- Connection from unknown client: ",
+        v_ASP_SCTP_Connected.peer_hostname, ":", v_ASP_SCTP_Connected.peer_portnumber);
+
+      //     Too early to close the connection here: SCTP will crash
+      //     Connection is closed when something is received on SCTP
+      //      SCTP_PORT.send(t_ASP_SCTP_Close(v_assocID));
+      //      log ("SCTP Connection closed.");
+    }
+    repeat;
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_SCTP_CommunicationUp
+// handle CommunicationUp messages of users which performed associate earlier
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_SCTP_CommunicationUp() runs on M3UA_SCTP_Daemon_CT
+{
+  // server and client mode is the same:
+  [] SCTP_PORT.receive(tr_S_SCTP_CommunicationUp
+    (?  // localSCTPassociationID,
+    )) -> value v_ASP_SCTP_ASSOC_CHANGE
+  {
+    v_assoc_Id := v_ASP_SCTP_ASSOC_CHANGE.client_id;
+    var integer index := f_Assoc_Exists( v_assoc_Id );
+
+    if (index != -1)
+    {
+      if (v_Table[index].commStatus == aSP_Down_sCTP_Associate_done)
+      {
+        v_Table[index].commStatus := aSP_Down_commUP_Received;
+        if (tsp_SCTP_PayloadProtocolID!=3) { // non-M3UA
+          v_Table[index].commStatus := aSP_Active;
+          if (ispresent(v_Table[index].tcp_client_id)) {
+            // send resume message:
+            v_MTP3_to_M3UAserver_msg_Status.msgType := resume_msgType;  // 6
+            v_MTP3_to_M3UAserver_msg_Status.data.resume := ok_resume; // 0
+
+            v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+            v_tcp_asp_Status.data :=
+            enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+            TCP_PORT.send(v_tcp_asp_Status);
+            if(tsp_logVerbose)
+            {
+              log("RESUME sent to user.");
+            }
+          }
+        }
+        if (tsp_logVerbose)
+        {
+          log("Association: #", v_Table[index].sCTP_Assoc_ID, " Index: #", index, " State changed to : ",v_Table[index].commStatus);
+        }
+        if ((not tsp_M3UA_Server_Mode) and
+          (tsp_SCTP_PayloadProtocolID == 3)) { // M3UA
+          f_ASPUP_Sending(index);
+        }
+      }
+      else
+      {
+        if (tsp_logVerbose)
+        {
+          log ("SCTP_CommunicationUp received in wrong state",
+            " (i.e. not after SCTP Associate done) index = ",index,
+            " comStatus: ", v_Table[index].commStatus);
+        }
+      }
+    }
+    else if (tsp_logVerbose)
+    {
+      log("Association does not exist (received in Communication Up)");
+    }
+    repeat;
+  }
+
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_Unexpected_SCTP_Events
+// handle error messages of users
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_Unexpected_SCTP_Events() runs on M3UA_SCTP_Daemon_CT
+{
+  // Handle communications lost message -> state of user with given index jumps
+  //  back to initial state and stays there!!
+  // That user will not be able to communicate anymore!!!
+  [] SCTP_PORT.receive (tr_S_SCTP_CommunicationLost (?))
+  -> value v_ASP_SCTP_ASSOC_CHANGE
+  {
+    //find corresponding element in Table
+    v_assoc_Id := v_ASP_SCTP_ASSOC_CHANGE.client_id;
+    var integer index := f_Assoc_Exists( v_assoc_Id );
+    if (index != -1)
+    {
+      if (ispresent(v_Table[index].tcp_client_id) and  //already registered
+        ( v_Table[index].commStatus == aSP_Active ))  // not paused yet
+      {
+        // send pause message:
+        v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType;  // 5
+        v_MTP3_to_M3UAserver_msg_Status.data.pause := SCTP_COMLOST_pause; // 0
+
+        v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        //v_Table[index].tcp_client_id := omit;  // unregister here
+        if(tsp_logVerbose)
+        {
+          log("PAUSE sent to user.");
+        }
+      }
+      v_Table[index].commStatus := aSP_Down_sCTP_Initialize_Done;
+      v_Table[index].sCTP_Assoc_ID := omit;
+      if (tsp_logVerbose)
+      {
+        log("SCTP_CommunicationLost received.");
+        log("User with index = ", index," can not communicate");
+        log("Association cleared: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("Association does not exist (received in Communication Lost).");
+      }
+    }
+
+    repeat;
+  }
+
+  [] SCTP_PORT.receive (tr_S_SCTP_ShutdownComplete (?)) -> value v_ASP_SCTP_ASSOC_CHANGE
+  {
+    v_assoc_Id := v_ASP_SCTP_ASSOC_CHANGE.client_id;
+    var integer index := f_Assoc_Exists( v_assoc_Id );
+    if (index != -1)
+    {
+      if (ispresent(v_Table[index].tcp_client_id) and //already registered
+        ( v_Table[index].commStatus == aSP_Active )) // not paused yet
+      {
+        // send pause message:
+        v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType;      // 5
+        v_MTP3_to_M3UAserver_msg_Status.data.pause := SCTP_COMLOST_pause;  // 0
+
+        v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        //v_Table[index].tcp_client_id := omit;  // unregister here
+        if(tsp_logVerbose)
+        {
+          log("PAUSE sent to user.");
+        }
+      }
+      v_Table[index].commStatus := aSP_Down_sCTP_Initialize_Done;
+      if (tsp_logVerbose)
+      {
+        log(" SCTP_ShutdownComplete received ");
+        log(" User with index = ", index," can not communicate");
+        log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("Association does not exist (received in Shutdown Complete).");
+      }
+    }
+
+    repeat;
+  }
+
+  [] SCTP_PORT.receive (tr_S_SCTP_ShutdownEvent (?)) -> value v_ASP_SCTP_SHUTDOWN_EVENT
+  {
+    v_assoc_Id := v_ASP_SCTP_SHUTDOWN_EVENT.client_id;
+    var integer index := f_Assoc_Exists( v_assoc_Id );
+    if (index != -1)
+    {
+      if (ispresent(v_Table[index].tcp_client_id) and //already registered
+        ( v_Table[index].commStatus == aSP_Active )) // not paused yet
+      {
+        // send pause message:
+        v_MTP3_to_M3UAserver_msg_Status.msgType := pause_msgType;      // 4
+        v_MTP3_to_M3UAserver_msg_Status.data.pause := SCTP_COMLOST_pause; // 0
+
+        v_tcp_asp_Status.client_id := v_Table[index].tcp_client_id;
+        v_tcp_asp_Status.data :=
+        enc_MTP3_to_M3UAserver_msg(v_MTP3_to_M3UAserver_msg_Status);
+        TCP_PORT.send(v_tcp_asp_Status);
+        //v_Table[index].tcp_client_id := omit;  // unregister here
+        if(tsp_logVerbose)
+        {
+          log("PAUSE sent to user.");
+        }
+      }
+      v_Table[index].commStatus := aSP_Down_sCTP_Initialize_Done;
+      if (tsp_logVerbose)
+      {
+        log(" SCTP_ShutdownEvent received ");
+        log(" User with index = ", index," can not communicate");
+        log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("Association does not exist (received in Shutdown Event).");
+      }
+    }
+
+    repeat;
+  }
+
+  //Send-reply received
+  [] as_SCTP_Send_Failed();
+
+  [] SCTP_PORT.receive (tr_S_SCTP_CANT_STR_ASSOC(?))
+  {
+    repeat;
+  }
+
+  [] SCTP_PORT.receive (tr_S_SCTP_Restart(?))-> value v_ASP_SCTP_ASSOC_CHANGE
+  {
+    v_assoc_Id := v_ASP_SCTP_ASSOC_CHANGE.client_id;
+    var integer index := f_Assoc_Exists( v_assoc_Id );
+    if (index != -1)
+    {
+      log("SCTP_Restart received.");
+      log("User with index=",index," back into state ASP Establish.");
+
+      v_Table[index].commStatus := aSP_Down_commUP_Received;
+
+      if (tsp_logVerbose)
+      {
+        log("Association: #", v_Table[index].sCTP_Assoc_ID, " State changed to : ",v_Table[index].commStatus );
+      }
+    }
+    else
+    {
+      if (tsp_logVerbose)
+      {
+        log("Association does not exist (received in Restart).");
+      }
+    }
+
+    repeat;
+  }
+
+  [] SCTP_PORT.receive
+  {
+    repeat;
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_handleSCTP_timers
+// Handles STCP timer events
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_handleSCTP_timers() runs on M3UA_SCTP_Daemon_CT
+{
+  [not tsp_SCTP_Server_Mode] T_Assoc_restart.timeout
+  {
+    for (var integer index := 0; index < v_Table_Size; index := index + 1)
+    {
+      if (v_Table[index].commStatus == aSP_Down_sCTP_Initialize_Done)
+      {
+        f_Associate(index);
+      }
+    }
+    T_Assoc_restart.start;
+    repeat;
+  }
+}
+
+//////////////////////////////////////
+//  TCP related definitions
+//////////////////////////////////////
+
+template ASP_TCP_Listen t_ASP_TCP_Listen(
+  template integer pl_portnumber,
+  template charstring pl_local_hostname
+) :=
+{
+  portnumber  := pl_portnumber,
+  local_hostname := pl_local_hostname
+}
+
+template ASP_TCP_Listen_result t_ASP_TCP_Listen_result(
+  template integer pl_portnumber
+) :=
+{
+  portnumber  := pl_portnumber
+}
+
+template ASP_TCP_Close t_ASP_TCP_Close(
+  template integer pl_client_id
+) :=
+{
+  client_id  := pl_client_id
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_initTCP
+// Opens listening TCP port towards the test case
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_initTCP() runs on M3UA_SCTP_Daemon_CT
+{
+  TCP_PORT.send(t_ASP_TCP_Listen(omit,omit));
+  var ASP_TCP_Listen_result v_ASP_TCP_Listen_result;
+  T_timer.start;
+  alt {
+    [] TCP_PORT.receive(t_ASP_TCP_Listen_result(?))
+    -> value v_ASP_TCP_Listen_result {
+      if (tsp_logVerbose) {
+        log("Listening on port ", v_ASP_TCP_Listen_result.portnumber);
+      }
+      T_timer.stop;
+    }
+    [] T_timer.timeout {
+      log("No reply for Listen");
+    }
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// function f_TCP_Client_Exists
+// It test if a TCP client with ID=clientID exists in the table
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_TCP_Client_Exists(integer clientID) runs on M3UA_SCTP_Daemon_CT return integer
+{
+  for (var integer index := 0; index < v_Table_Size; index := index + 1)
+  {
+    if (v_Table[index].tcp_client_id == clientID) // user found
+    {
+      return index;
+    }
+  }
+  if (tsp_logVerbose)
+  {
+    log("TCP client not Found: ", clientID);
+  }
+  return -1;
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+// altstep as_Unexpected_TCP_Events
+// Handles unexpected messages on the TCP port
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+altstep as_Unexpected_TCP_Events() runs on M3UA_SCTP_Daemon_CT
+{
+  [] TCP_PORT.receive(t_ASP_TCP_Close(*)) -> value v_ASP_TCP_Close {
+    var integer index := f_TCP_Client_Exists(v_ASP_TCP_Close.client_id);
+    if (index != -1) {
+      // unregister client:
+      log("User ", index, " unexpectedly closed the connection, user unregistered.");
+      v_Table[index].tcp_client_id := omit;
+    }
+    repeat;
+  }
+  [] TCP_PORT.receive {
+    repeat;
+  }
+}
+
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+//  testcase tc_M3UA_SCTP_Daemon
+//+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+function f_M3UA_SCTP_Daemon(in CharstringList p_M3UA_Entities_ASPUP_waitList) runs on M3UA_SCTP_Daemon_CT
+{
+  v_M3UA_Entities_ASPUP_waitList := p_M3UA_Entities_ASPUP_waitList;
+
+  // Initialize the Table with parameters read from the configuration file
+  f_Initialize_Table();
+
+  map(self:SCTP_PORT, system:SCTP_PORT);   // map performs initLibrary
+  map(self:TCP_PORT, system:TCP_PORT);
+
+  connect(self:SYNC_PCO, mtc:SYNC_PCO);
+
+  // Initialize TCP connection
+  f_initTCP();
+
+  log("***************************************************************");
+  log("M3UA_SCTP Daemon initiated, the test can be started.");
+  log("***************************************************************");
+
+  // Initialize for all SCTP users SEQUENTIALLY
+  f_Initialize_SCTP();
+
+  // Initialize for all M3UA users SEQUENTIALLY
+  f_Initialize_M3UA();
+
+  // Start the main function
+  f_M3UA_SCTP_Daemon_Start();
+
+} // End of testcase tc_M3UA_SCTP_Daemon
+
+function f_M3UA_stop() runs on M3UA_SCTP_Daemon_CT
+{
+  log("***************************************************************");
+  log("M3UA_SCTP Daemon is shutting down.");
+  log("***************************************************************");
+
+  unmap(self:TCP_PORT, system:TCP_PORT);
+  unmap(self:SCTP_PORT, system:SCTP_PORT);
+  disconnect(self:SYNC_PCO, mtc:SYNC_PCO);
+
+  kill;
+}
+
+} // End of module
